@@ -1,0 +1,167 @@
+import os
+import json
+import faiss
+import numpy as np
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_openai.chat_models.base import BaseChatOpenAI
+from sentence_transformers import SentenceTransformer
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import requests
+from bs4 import BeautifulSoup
+
+# Load environment variables
+load_dotenv()
+
+# Streamlit Page Configuration
+st.set_page_config(page_title="🌐 Website Chatbot", layout="wide")
+
+# Initialize session state
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []
+
+if "website_content" not in st.session_state:
+    st.session_state["website_content"] = None
+
+# ---- Sidebar for Website Input ----
+st.sidebar.header("🔗 Enter Website URL")
+website_url = st.sidebar.text_input("Enter the URL of the website:")
+
+if st.sidebar.button("Fetch Website"):
+    if website_url:
+        try:
+            response = requests.get(website_url)
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            # Extract the main content using specific tags
+            main_content = soup.find('main') or soup.find('article') or soup.find('section')
+
+            if main_content:
+                text = ' '.join([p.get_text() for p in main_content.find_all(['p', 'h1', 'h2', 'h3', 'li'])])
+            else:
+                # Fallback: extract from the whole page if main content is not found
+                text = ' '.join([p.get_text() for p in soup.find_all(['p', 'h1', 'h2', 'h3', 'li'])])
+
+            # Remove unwanted elements
+            for unwanted in soup(['nav', 'footer', 'aside', 'script', 'style']):
+                unwanted.extract()
+
+            # Clean extracted text
+            text = ' '.join(text.split())
+
+            if not text.strip():
+                raise ValueError("The website content is empty or could not be extracted.")
+
+            st.session_state["website_content"] = text
+            st.sidebar.success("✅ Website content fetched successfully!")
+        except Exception as e:
+            st.sidebar.error(f"⚠️ Error fetching website: {e}")
+            st.session_state["website_content"] = None
+    else:
+        st.sidebar.warning("⚠️ Please enter a valid URL.")
+
+st.sidebar.markdown("---")
+
+# ---- Chat UI ----
+col1, col2 = st.columns([4, 1])
+
+with col1:
+    st.subheader("💬 Chat with the Website")
+    chat_container = st.container()
+
+    # Display chat history
+    for chat in st.session_state["chat_history"]:
+        with chat_container:
+            st.markdown(f"**🧑‍💻 You:** {chat['question']}")
+            st.markdown(f"{chat['thinking']}")
+            st.markdown(f"{chat['answer']}*")
+
+    # Function to handle new questions
+    def handle_new_question():
+        if st.session_state.user_query.strip():
+            st.session_state["chat_history"].append({
+                "question": st.session_state.user_query.strip(),
+                "thinking": "Thinking...",
+                "answer": "..."
+            })
+            st.session_state.user_query = ""
+
+    # Input box with Enter-to-submit and clear
+    user_query = st.text_input(
+        "📝 Ask a question about the website",
+        key="user_query",
+        on_change=handle_new_question
+    )
+
+# ---- Process User Question ----
+if st.session_state["chat_history"] and st.session_state["chat_history"][-1]["thinking"] == "Thinking...":
+    latest_chat = st.session_state["chat_history"][-1]
+    user_question = latest_chat["question"]
+
+    if st.session_state["website_content"]:
+        website_text = st.session_state["website_content"]
+
+        # Split text into chunks
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        chunks = splitter.split_text(website_text)
+
+        # Generate embeddings
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        embeddings = model.encode(chunks)
+        embeddings = np.array(embeddings, dtype=np.float32)
+
+        # Store in FAISS index
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+
+        # Save chunks for later retrieval
+        with open("website_chunks.json", "w", encoding="utf-8") as f:
+            json.dump(chunks, f)
+
+        # Load FAISS index & model
+        embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+        # Load chunks
+        with open("website_chunks.json", "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+
+        # LangChain LLM Initialization
+        llm = BaseChatOpenAI(
+            model=,
+            api_key=,  # Use API key from environment variables
+            base_url=
+        )
+
+        # Retrieve relevant content
+        def retrieve_text(query, top_k=3):
+            query_embedding = embedding_model.encode([query]).astype(np.float32)
+            distances, indices = index.search(query_embedding, top_k)
+            retrieved_text = " ".join([chunks[i] for i in indices[0]])
+            return retrieved_text
+
+        # Generate response with LLM
+        def chatbot(query):
+            relevant_text = retrieve_text(query)
+            try:
+                response = llm.invoke(f"Context: {relevant_text}\n\nQuery: {query}\n\nProvide a detailed reasoning followed by a clear conclusion.")
+                print("LLM Response:", response)  # Debugging print
+                return response.content if response else "No response received."
+            except Exception as e:
+                print("Error:", e)
+                return f"Error occurred: {e}"
+
+        # Fetch answer
+        bot_answer = chatbot(user_question)
+
+        # Splitting into Thinking & Conclusion
+        if "Conclusion:" in bot_answer:
+            thinking_part, conclusion_part = bot_answer.split("Conclusion:", 1)
+            thinking_part = thinking_part.strip()
+            conclusion_part = conclusion_part.strip()
+        else:
+            thinking_part = bot_answer.strip()
+
+        # Update chat history and refresh UI
+        latest_chat["thinking"] = thinking_part
+        latest_chat["answer"] = conclusion_part
+        st.rerun()  # Force Streamlit to update UI
